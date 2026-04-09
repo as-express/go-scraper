@@ -2,17 +2,15 @@ module halyk-go-test
 
 go 1.26.2
 
-require github.com/playwright-community/playwright-go v0.5700.1
+require (
+	github.com/go-rod/rod v0.116.2
+	github.com/go-rod/stealth v0.4.9
+	github.com/redis/go-redis/v9 v9.18.0
+)
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/deckarep/golang-set/v2 v2.8.0 // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
-	github.com/go-jose/go-jose/v3 v3.0.5 // indirect
-	github.com/go-rod/rod v0.116.2 // indirect
-	github.com/go-rod/stealth v0.4.9 // indirect
-	github.com/go-stack/stack v1.8.1 // indirect
-	github.com/redis/go-redis/v9 v9.18.0 // indirect
 	github.com/stretchr/testify v1.9.0 // indirect
 	github.com/ysmood/fetchup v0.2.3 // indirect
 	github.com/ysmood/goob v0.4.0 // indirect
