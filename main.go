@@ -84,6 +84,12 @@ func runWorker(id int, user string, itemURL string, rdb *redis.Client) {
 
 	go func() {
 		for {
+			qLen, err := rdb.LLen(ctx, "halyk:tokens_list").Result()
+			if err == nil && qLen >= 200 {
+				time.Sleep(10 * time.Second)
+				continue
+			}
+
 			session.mu.RLock()
 			cookieHeader := session.Cookie
 			ua := session.UA
@@ -113,7 +119,7 @@ func runWorker(id int, user string, itemURL string, rdb *redis.Client) {
 
 			if resp.StatusCode == 200 {
 				rdb.LPush(ctx, "halyk:tokens_list", string(body))
-				rdb.Expire(ctx, "halyk:tokens_list", 30000*time.Second)
+				rdb.Expire(ctx, "halyk:tokens_list", 24*time.Hour)
 			} else if resp.StatusCode == 429 {
 				log.Printf("⚠️ [Worker %d] Rate limit! Sleeping 30s...", id)
 				time.Sleep(30 * time.Second)
@@ -127,6 +133,7 @@ func runWorker(id int, user string, itemURL string, rdb *redis.Client) {
 	for {
 		time.Sleep(15 * time.Minute)
 		if err := page.Reload(); err != nil {
+			log.Printf("⚠️ [Worker %d] Reload failed: %v", id, err)
 			continue
 		}
 		time.Sleep(10 * time.Second)
@@ -135,17 +142,25 @@ func runWorker(id int, user string, itemURL string, rdb *redis.Client) {
 }
 
 func main() {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPass})
-	
-	// ВЫСТАВЛЯЕМ 25 ВОРКЕРОВ
-	workersCount := 10 
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     redisAddr,
+		Password: redisPass,
+	})
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		log.Fatalf("❌ Redis connection failed: %v", err)
+	}
+	fmt.Println("🗄️ Redis подключен")
+
+	workersCount := 3 
 
 	for i := 1; i <= workersCount; i++ {
 		sessionID := fmt.Sprintf("session-%d", i)
-		go runWorker(i, "T8uC7pgTQX-country-kz-city-almaty-"+sessionID, 
+		proxyUser := "T8uC7pgTQX-country-kz-city-almaty-" + sessionID
+		
+		go runWorker(i, proxyUser, 
 			"https://halykmarket.kz/category/smartfony/smartfon-apple-iphone-17-pro-6a58?sku=256gb_cosmicorange", rdb)
 		
-		// Пауза 8 секунд между запуском БРАУЗЕРОВ, чтобы RAM не подскочила резко
 		time.Sleep(8 * time.Second) 
 	}
 
