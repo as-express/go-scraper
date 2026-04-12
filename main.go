@@ -3,17 +3,15 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"math/rand"
-	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
+	"github.com/go-rod/rod/lib/proto"
 	"github.com/go-rod/stealth"
 	"github.com/redis/go-redis/v9"
 )
@@ -21,156 +19,186 @@ import (
 var ctx = context.Background()
 
 const (
-	redisAddr = "38.244.134.103:6380"
-	redisPass = "asd12edasd112ad"
-	proxyHost = "res-unlimited-ef41714c.plainproxies.com:8080"
-	proxyPass = "9LYOsXqbaVmRpEj"
+	redisAddr    = "localhost:6379"
+	workerCount  = 10
+	targetURL    = "https://halykmarket.kz/category/smartfony/smartfon-apple-iphone-17-pro-max-0e6f?sku=256gb_silver"
+	testDuration = 5 * time.Minute
 )
 
-type Session struct {
+type SharedData struct {
 	Cookie string
+	DTPC   string
 	UA     string
 	mu     sync.RWMutex
 }
 
-func runWorker(id int, user string, itemURL string, rdb *redis.Client) {
-    fmt.Printf("🚀 [Worker %d] Starting...\n", id)
+var (
+	shared      = &SharedData{}
+	totalSaved  int64
+	counterMu   sync.Mutex
+	startTime   time.Time
+	timerOnce   sync.Once
+	testRunning = true
+)
 
-    l := launcher.New().Headless(true).NoSandbox(true).Proxy(proxyHost)
-    launchURL, err := l.Launch()
-    if err != nil {
-        log.Printf("❌ [Worker %d] Launcher Error: %v", id, err)
-        return
-    }
+func runMaster() {
+	for {
+		log.Println("👑 [Master] Обновление сессии через Real Chrome...")
+		l := launcher.New().Headless(false).Devtools(false)
+		u, err := l.Launch()
+		if err != nil {
+			time.Sleep(5 * time.Second)
+			continue
+		}
 
-    browser := rod.New().ControlURL(launchURL).MustConnect()
-    defer browser.MustClose()
+		browser := rod.New().ControlURL(u).MustConnect()
+		page := stealth.MustPage(browser)
 
-    go browser.MustHandleAuth(user, proxyPass)()
-    page := stealth.MustPage(browser)
+		if err := page.Navigate(targetURL); err != nil {
+			browser.MustClose()
+			continue
+		}
 
-    session := &Session{}
+		time.Sleep(15 * time.Second)
+		page.Mouse.MustScroll(0, 400)
+		time.Sleep(5 * time.Second)
 
-    updateSession := func() {
-        session.mu.Lock()
-        defer session.mu.Unlock()
+		cookies, _ := page.Cookies([]string{})
+		var cookieParts []string
+		dtpc := ""
+		for _, c := range cookies {
+			cookieParts = append(cookieParts, fmt.Sprintf("%s=%s", c.Name, c.Value))
+			if c.Name == "dtPC" {
+				dtpc = c.Value
+			}
+		}
+		fullCookie := strings.Join(cookieParts, "; ")
 
-        cookies, _ := page.Cookies([]string{})
-        var cookieParts []string
-        for _, c := range cookies {
-            cookieParts = append(cookieParts, fmt.Sprintf("%s=%s", c.Name, c.Value))
-        }
-        session.Cookie = strings.Join(cookieParts, "; ")
-        ua, _ := page.Eval(`() => navigator.userAgent`)
-        session.UA = ua.Value.Str()
-    }
+		if len(fullCookie) > 1500 && dtpc != "" {
+			ua, _ := page.Eval(`() => navigator.userAgent`)
+			shared.mu.Lock()
+			shared.Cookie = fullCookie
+			shared.DTPC = dtpc
+			shared.UA = ua.Value.Str()
+			shared.mu.Unlock()
+			log.Printf("✅ [Master] СЕССИЯ ГОТОВА. DTPC: %s", dtpc)
+			time.Sleep(10 * time.Minute)
+		} else {
+			time.Sleep(5 * time.Second)
+		}
+		browser.MustClose()
+	}
+}
 
-    if err := page.Navigate(itemURL); err != nil {
-        log.Printf("❌ [Worker %d] Init Nav Error: %v", id, err)
-        return
-    }
-    time.Sleep(20 * time.Second)
-    page.Mouse.MustScroll(0, 700)
-    updateSession()
+func runWorker(id int, rdb *redis.Client) {
+	l := launcher.New().Headless(true)
+	u, _ := l.Launch()
+	browser := rod.New().ControlURL(u).MustConnect()
+	defer browser.MustClose()
 
-    proxyFull := fmt.Sprintf("http://%s:%s@%s", user, proxyPass, proxyHost)
-    pURL, _ := url.Parse(proxyFull)
-    client := &http.Client{
-        Transport: &http.Transport{
-            Proxy: http.ProxyURL(pURL),
-        },
-        Timeout: 15 * time.Second,
-    }
+	for testRunning {
+		shared.mu.RLock()
+		cookie, ua, dtpc := shared.Cookie, shared.UA, shared.DTPC
+		shared.mu.RUnlock()
 
-    go func() {
-        for {
-            qLen, err := rdb.ZCard(ctx, "halyk:tokens_set").Result()
-            if err == nil && qLen >= 200 {
-                time.Sleep(10 * time.Second)
-                continue
-            }
+		if dtpc == "" {
+			time.Sleep(2 * time.Second)
+			continue
+		}
 
-            session.mu.RLock()
-            cookieHeader := session.Cookie
-            ua := session.UA
-            session.mu.RUnlock()
+		page := stealth.MustPage(browser)
+		_ = page.MustSetUserAgent(&proto.NetworkSetUserAgentOverride{UserAgent: ua})
 
-            if len(cookieHeader) < 20 {
-                time.Sleep(2 * time.Second)
-                continue
-            }
+		for _, p := range strings.Split(cookie, "; ") {
+			kv := strings.SplitN(p, "=", 2)
+			if len(kv) == 2 {
+				_ = page.SetCookies([]*proto.NetworkCookieParam{{
+					Name: kv[0], Value: kv[1], Domain: "halykmarket.kz",
+				}})
+			}
+		}
 
-            req, _ := http.NewRequest("POST", "https://halykmarket.kz/submarkets/offer-service/public/offers/token", nil)
-            req.Header.Set("accept", "application/json, text/plain, */*")
-            req.Header.Set("citycode", "750000000")
-            req.Header.Set("cookie", cookieHeader)
-            req.Header.Set("user-agent", ua)
-            req.Header.Set("origin", "https://halykmarket.kz")
-            req.Header.Set("referer", itemURL)
+		if err := page.Navigate(targetURL); err != nil {
+			page.MustClose()
+			continue
+		}
+		page.MustWaitStable()
 
-            resp, err := client.Do(req)
-            if err != nil {
-                time.Sleep(5 * time.Second)
-                continue
-            }
+		for i := 0; i < 10 && testRunning; i++ {
+			js := fmt.Sprintf(`async () => {
+				try {
+					const res = await fetch("https://halykmarket.kz/submarkets/offer-service/public/offers/token", {
+						method: "POST",
+						headers: { 
+							"accept": "application/json, text/plain, */*",
+							"citycode": "750000000",
+							"x-dtpc": "%s"
+						}
+					});
+					return await res.text();
+				} catch (e) { return "ERR"; }
+			}`, dtpc)
 
-            body, _ := io.ReadAll(resp.Body)
-            resp.Body.Close()
+			result, err := page.Eval(js)
+			resBody := ""
+			if err == nil {
+				resBody = result.Value.Str()
+			}
 
-            if resp.StatusCode == 200 {
-                expirationTime := float64(time.Now().Unix() + 300) 
-                
-                rdb.ZAdd(ctx, "halyk:tokens_set", redis.Z{
-                    Score:  expirationTime,
-                    Member: string(body),
-                })
-                
-                rdb.ZRemRangeByScore(ctx, "halyk:tokens_set", "-inf", fmt.Sprintf("%d", time.Now().Unix()))
-                
-            } else if resp.StatusCode == 429 {
-                log.Printf("⚠️ [Worker %d] Rate limit! Sleeping 30s...", id)
-                time.Sleep(30 * time.Second)
-            }
+			if strings.Contains(resBody, "offersToken") {
+				// Запуск таймера при ПЕРВОМ токене
+				timerOnce.Do(func() {
+					startTime = time.Now()
+					log.Println("🏁 ТЕСТ НАЧАТ! ОТСЧЕТ 5 МИНУТ ПОШЕЛ...")
+					go func() {
+						time.Sleep(testDuration)
+						testRunning = false
+						log.Println("🛑 ВРЕМЯ ВЫШЛО!")
+					}()
+				})
 
-            sleepMs := 300 + rand.Intn(200)
-            time.Sleep(time.Duration(sleepMs) * time.Millisecond)
-        }
-    }()
-
-    for {
-        time.Sleep(15 * time.Minute)
-        log.Printf("🔄 [Worker %d] Reloading page to refresh cookies...", id)
-        if err := page.Reload(); err != nil {
-            log.Printf("⚠️ [Worker %d] Reload failed: %v", id, err)
-            continue
-        }
-        time.Sleep(10 * time.Second)
-        updateSession()
-    }
-} 
+				rdb.ZAdd(ctx, "halyk:tokens", redis.Z{Score: float64(time.Now().Unix()), Member: resBody})
+				counterMu.Lock()
+				totalSaved++
+				counterMu.Unlock()
+				log.Printf("🔥 [W%d] +1 (Всего: %d)", id, totalSaved)
+			} else {
+				log.Printf("❌ [W%d] Ошибка API, сплю 10 сек...", id)
+				time.Sleep(10 * time.Second)
+				break
+			}
+			time.Sleep(time.Duration(1500+rand.Intn(2000)) * time.Millisecond)
+		}
+		page.MustClose()
+	}
+}
 
 func main() {
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     redisAddr,
-		Password: redisPass,
-	})
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
+	go runMaster()
 
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatalf("❌ Redis connection failed: %v", err)
-	}
-	fmt.Println("🗄️ Redis подключен")
-
-	workersCount := 3 
-
-	for i := 1; i <= workersCount; i++ {
-		sessionID := fmt.Sprintf("session-%d", i)
-		proxyUser := "T8uC7pgTQX-country-kz-city-almaty-" + sessionID
-		
-		go runWorker(i, proxyUser, 
-			"https://halykmarket.kz/category/smartfony/smartfon-apple-iphone-17-pro-6a58?sku=256gb_cosmicorange", rdb)
-		
-		time.Sleep(8 * time.Second) 
+	fmt.Println("⏳ Ожидание инициализации...")
+	for {
+		shared.mu.RLock()
+		ready := shared.DTPC != ""
+		shared.mu.RUnlock()
+		if ready { break }
+		time.Sleep(2 * time.Second)
 	}
 
-	select {}
+	for i := 1; i <= workerCount; i++ {
+		go runWorker(i, rdb)
+	}
+
+	for testRunning {
+		time.Sleep(10 * time.Second)
+		if !startTime.IsZero() {
+			timeLeft := testDuration - time.Since(startTime)
+			if timeLeft < 0 { timeLeft = 0 }
+			log.Printf("📊 СТАТУС: %d токенов. Осталось: %v", totalSaved, timeLeft.Round(time.Second))
+		}
+	}
+
+	fmt.Printf("\n🏆 ТЕСТ ЗАВЕРШЕН!\nИТОГО СОБРАНО: %d\nСРЕДНЯЯ СКОРОСТЬ: %.2f токенов/мин\n", 
+		totalSaved, float64(totalSaved)/5.0)
 }
