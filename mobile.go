@@ -23,13 +23,25 @@ var ctx = context.Background()
 const (
 	redisAddr    = "89.207.255.53:6380"
 	redisPass    = "asd12edasd112ad"
-	workerCount  = 50
-	testDuration = 30 * time.Minute
-
+	workerCount  = 200 
+	
 	proxyRawAddr = "res-unlimited-ef41714c.plainproxies.com:8080"
 	proxyPass    = "anZI8uGb8WpS3rZ"
 	proxyBaseUsr = "IPNz1S83Ei-country-kz"
 )
+
+var userAgents = []string{
+	"Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
+	"Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+	"Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.118 Mobile Safari/537.36",
+	"Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
+}
+
+var globalTransport = &http.Transport{
+	MaxIdleConns:        1000,
+	MaxIdleConnsPerHost: 200,
+	IdleConnTimeout:     90 * time.Second,
+}
 
 var cities = []string{"750000000", "710000000", "511010000"}
 
@@ -59,7 +71,6 @@ var targets = []string{
 
 type SharedData struct {
 	Cookie string
-	UA     string
 	mu     sync.RWMutex
 }
 
@@ -73,22 +84,22 @@ var (
 
 func runMaster() {
 	for {
-		log.Println("👑 [Master] Обновление глобальной сессии...")
-		l := launcher.New().Headless(true)
+		log.Println("👑 [Master] Обновление сессии...")
+		l := launcher.New().Bin("/usr/bin/google-chrome").Headless(true).NoSandbox(true)
 		u, err := l.Launch()
 		if err != nil {
-			time.Sleep(5 * time.Second)
+			time.Sleep(10 * time.Second)
 			continue
 		}
 
 		browser := rod.New().ControlURL(u).MustConnect().MustIgnoreCertErrors(true)
-		go func() { _ = browser.HandleAuth(proxyBaseUsr+"-session-master", proxyPass)() }()
+		go func() { _ = browser.HandleAuth(proxyBaseUsr+"-master-"+fmt.Sprint(rand.Intn(999)), proxyPass)() }()
 
 		page := stealth.MustPage(browser)
 		err = rod.Try(func() {
-			page.MustNavigate(targets[0])
+			page.MustNavigate(targets[rand.Intn(len(targets))])
 			page.MustWaitIdle()
-			time.Sleep(15 * time.Second)
+			time.Sleep(time.Duration(12+rand.Intn(5)) * time.Second)
 		})
 
 		cookies, _ := page.Cookies([]string{})
@@ -97,14 +108,13 @@ func runMaster() {
 			cookieParts = append(cookieParts, fmt.Sprintf("%s=%s", c.Name, c.Value))
 		}
 
-		if len(cookieParts) > 5 {
+		if len(cookieParts) >= 4 {
 			shared.mu.Lock()
 			shared.Cookie = strings.Join(cookieParts, "; ")
-			shared.UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
 			shared.mu.Unlock()
-			log.Printf("✅ [Master] Сессия готова. Кук: %d", len(cookieParts))
+			log.Printf("✅ [Master] Сессия готова. (Кук: %d)", len(cookieParts))
 			browser.MustClose()
-			time.Sleep(7 * time.Minute)
+			time.Sleep(120 * time.Second) 
 		} else {
 			browser.MustClose()
 			time.Sleep(10 * time.Second)
@@ -113,22 +123,12 @@ func runMaster() {
 }
 
 func runWorker(id int, rdb *redis.Client) {
+	client := &http.Client{Transport: globalTransport, Timeout: 10 * time.Second}
+	myUA := userAgents[rand.Intn(len(userAgents))]
+
 	for testRunning {
-		sessionID := rand.Intn(999999)
-		proxyStr := fmt.Sprintf("http://%s-session-%d-ttl-600:%s@%s", proxyBaseUsr, sessionID, proxyPass, proxyRawAddr)
-		proxyURL, _ := url.Parse(proxyStr)
-
-		client := &http.Client{
-			Transport: &http.Transport{
-				Proxy: http.ProxyURL(proxyURL),
-				MaxIdleConns: 5,
-				IdleConnTimeout: 30 * time.Second,
-			},
-			Timeout: 10 * time.Second,
-		}
-
 		shared.mu.RLock()
-		cookie, ua := shared.Cookie, shared.UA
+		cookie := shared.Cookie
 		shared.mu.RUnlock()
 
 		if cookie == "" {
@@ -136,16 +136,24 @@ func runWorker(id int, rdb *redis.Client) {
 			continue
 		}
 
+		sessionID := rand.Intn(1000000)
+		proxyStr := fmt.Sprintf("http://%s-session-%d-ttl-60:%s@%s", proxyBaseUsr, sessionID, proxyPass, proxyRawAddr)
+		proxyURL, _ := url.Parse(proxyStr)
+		client.Transport.(*http.Transport).Proxy = http.ProxyURL(proxyURL)
+
 		target := targets[rand.Intn(len(targets))]
 		city := cities[rand.Intn(len(cities))]
 
 		req, _ := http.NewRequest("POST", "https://m.halykmarket.kz/submarkets/offer-service/public/offers/token", nil)
-		req.Header.Set("User-Agent", ua)
+		req.Header.Set("User-Agent", myUA)
 		req.Header.Set("Cookie", cookie)
 		req.Header.Set("CityCode", city)
 		req.Header.Set("Referer", target)
-		req.Header.Set("Accept", "application/json, text/plain, */*")
-		req.Header.Set("Content-Length", "0")
+		req.Header.Set("Accept", "application/json")
+		
+		req.Header.Set("Sec-Fetch-Dest", "empty")
+		req.Header.Set("Sec-Fetch-Mode", "cors")
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
 
 		resp, err := client.Do(req)
 		if err != nil {
@@ -155,48 +163,54 @@ func runWorker(id int, rdb *redis.Client) {
 		if resp.StatusCode == 200 {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			resBody := string(body)
-
-			if strings.Contains(resBody, "offersToken") {
-				rdb.ZAdd(ctx, "halyk:tokens", redis.Z{Score: float64(time.Now().Unix()), Member: resBody})
+			
+			if strings.Contains(string(body), "offersToken") {
+				rdb.ZAdd(ctx, "halyk:tokens", redis.Z{Score: float64(time.Now().Unix()), Member: string(body)})
+				
 				counterMu.Lock()
 				if startTime.IsZero() { startTime = time.Now() }
 				totalSaved++
 				counterMu.Unlock()
 				
-				time.Sleep(time.Duration(2500+rand.Intn(3000)) * time.Millisecond) // Чуть ускорил интервал
+				jitter := 150 + rand.Intn(350) 
+				time.Sleep(time.Duration(jitter) * time.Millisecond)
+
+				if rand.Intn(100) < 5 {
+					time.Sleep(time.Duration(3+rand.Intn(4)) * time.Second)
+				}
 			}
 		} else {
 			resp.Body.Close()
-			time.Sleep(5 * time.Second)
+			time.Sleep(time.Duration(2+rand.Intn(3)) * time.Second)
 		}
 	}
 }
 
 func main() {
-	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPass})
+	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, Password: redisPass, PoolSize: 500})
 	go runMaster()
 
-	fmt.Println("🚀 Запуск мульти-таргет + мульти-сити воркеров...")
 	for {
 		shared.mu.RLock()
-		if shared.Cookie != "" { 
-			shared.mu.RUnlock()
-			break 
-		}
+		ready := shared.Cookie != ""
 		shared.mu.RUnlock()
-		time.Sleep(1 * time.Second)
+		if ready { break }
+		time.Sleep(2 * time.Second)
 	}
 
+	fmt.Printf("🚀 Безопасный запуск. Целей: %d | Воркеров: %d\n", len(targets), workerCount)
 	for i := 1; i <= workerCount; i++ {
 		go runWorker(i, rdb)
 	}
 
 	for testRunning {
-		time.Sleep(300 * time.Second)
+		time.Sleep(30 * time.Second)
 		if !startTime.IsZero() {
-			log.Printf("📊 СТАТ: %d токенов | Целей: %d | Городов: 2 | Скорость: %.2f т/сек", 
-				totalSaved, len(targets), float64(totalSaved)/time.Since(startTime).Seconds())
+			counterMu.Lock()
+			count := totalSaved
+			counterMu.Unlock()
+			elapsed := time.Since(startTime).Seconds()
+			log.Printf("📊 СТАТ: %d токенов | Скорость: %.2f т/сек", count, float64(count)/elapsed)
 		}
 	}
 }
